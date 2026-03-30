@@ -1,6 +1,6 @@
 # 02 — Custom Resource Definitions (CRD): Deep Dive
 
-> **Series**: CRD & Operators on AKS | Senior Engineer (12 YOE) Interview Prep
+> **Series**: CRD & Operators on AKS 
 
 ---
 
