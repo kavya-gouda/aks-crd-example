@@ -142,19 +142,255 @@ scope: Cluster
 
 ### Structural Schema (Required since k8s 1.15+)
 
-Every CRD in `apiextensions.k8s.io/v1` MUST have a **structural schema**. Rules:
-1. Must define `type` at every level
-2. Cannot use `x-kubernetes-preserve-unknown-fields: true` at top level (except for extensibility)
-3. Enables **pruning** (unknown fields are dropped)
-4. Enables **defaulting**
-5. Enables **nullable** fields
+#### What Problem Does It Solve?
+
+Before structural schema (the old `v1beta1` CRDs), you could write a CRD with **no schema at all**. The API server accepted any arbitrary YAML — no validation, no type checking, no defaults. This caused silent bugs where typos in field names were accepted and simply ignored.
 
 ```yaml
-# Preserve unknown fields in a specific nested object (escape hatch)
+# OLD way — v1beta1, no schema (BAD, removed in k8s 1.22)
+apiVersion: apiextensions.k8s.io/v1beta1
+kind: CustomResourceDefinition
+spec:
+  validation:
+    openAPIV3Schema:
+      type: object    # That's it — no field definitions at all
+```
+
+**Structural schema** forces you to describe every field with a `type`. Once you do that, Kubernetes unlocks powerful features automatically.
+
+---
+
+#### The Core Rule: Every Level Must Have a `type`
+
+Think of it like TypeScript vs JavaScript. In plain JavaScript you can pass any object anywhere. In TypeScript (structural schema), every field must have a declared type.
+
+```yaml
+# NON-structural (broken) — missing type on nested object
+properties:
+  spec:
+    properties:          # ❌ ERROR: no "type: object" here
+      engine:
+        type: string
+
+# STRUCTURAL (correct) — type declared at every level
+properties:
+  spec:
+    type: object         # ✅ type declared
+    properties:
+      engine:
+        type: string     # ✅ type declared
+      replicas:
+        type: integer    # ✅ type declared
+      config:
+        type: object     # ✅ type declared
+        properties:
+          timeout:
+            type: string # ✅ type declared
+```
+
+**Rule**: Every `properties`, `items` (for arrays), and `additionalProperties` must have a `type` at its own level.
+
+---
+
+#### Feature 1: Pruning (Unknown Fields Are Dropped)
+
+Once you have a structural schema, the API server automatically **removes any field you didn't define** in the schema. This is called **pruning**.
+
+```yaml
+# Your CRD schema defines only these fields:
 spec:
   type: object
-  x-kubernetes-preserve-unknown-fields: true  # Only at nested level
+  properties:
+    engine:
+      type: string
+    replicas:
+      type: integer
 ```
+
+```yaml
+# User submits this CR with an extra typo'd field:
+spec:
+  engine: postgres
+  replicas: 3
+  engnie: postgres     # ← typo — extra unknown field
+  myCustomField: "foo" # ← not in schema
+```
+
+```yaml
+# What actually gets stored in etcd (after pruning):
+spec:
+  engine: postgres
+  replicas: 3
+  # engnie and myCustomField are silently DROPPED ✅
+```
+
+**Why pruning matters:**
+- Prevents garbage accumulating in etcd
+- Catches typos immediately (field is dropped → controller doesn't see it → behavior unexpected → you notice and fix it)
+- Before pruning, `engnie: postgres` would sit silently in etcd forever and your controller would read `engine: ""` — very hard to debug
+
+---
+
+#### Feature 2: Defaulting (Auto-fill Missing Fields)
+
+Structural schema enables server-side defaults. When a user doesn't provide a field, the API server fills it in automatically **before storing in etcd**.
+
+```yaml
+spec:
+  type: object
+  properties:
+    replicas:
+      type: integer
+      default: 1            # If user omits replicas, it becomes 1
+
+    storageClass:
+      type: string
+      default: "managed-premium"   # AKS default
+
+    backup:
+      type: object
+      default:              # Entire object default
+        enabled: false
+        schedule: "0 2 * * *"
+      properties:
+        enabled:
+          type: boolean
+        schedule:
+          type: string
+```
+
+```yaml
+# User submits (minimal):
+spec:
+  engine: postgres
+
+# What gets stored in etcd (after defaulting):
+spec:
+  engine: postgres
+  replicas: 1                      # ← filled in by default
+  storageClass: "managed-premium"  # ← filled in by default
+  backup:
+    enabled: false                 # ← filled in by default
+    schedule: "0 2 * * *"          # ← filled in by default
+```
+
+**Why defaulting in schema is better than defaulting in controller:**
+- Controller always sees the default values — no nil checks needed
+- `kubectl get database mydb -o yaml` shows the actual stored values — no surprises
+- Default is applied once at admission, not re-applied every reconcile
+
+---
+
+#### Feature 3: Nullable Fields
+
+Sometimes a field is an object but you want to allow users to explicitly set it to `null` to "unset" it:
+
+```yaml
+properties:
+  backup:
+    type: object
+    nullable: true         # Allows: backup: null  (to disable)
+    properties:
+      enabled:
+        type: boolean
+```
+
+```yaml
+# Without nullable: true, this would be rejected:
+spec:
+  backup: null    # ❌ error without nullable
+
+# With nullable: true:
+spec:
+  backup: null    # ✅ accepted — means "no backup config"
+```
+
+---
+
+#### Feature 4: x-kubernetes-preserve-unknown-fields (Escape Hatch)
+
+Sometimes you genuinely need to accept arbitrary key-value data — for example, a field that holds user-defined labels, arbitrary config, or raw Helm values. Use `x-kubernetes-preserve-unknown-fields: true` **only on that specific nested field**:
+
+```yaml
+spec:
+  type: object
+  properties:
+    engine:
+      type: string             # ← still validated normally
+    replicas:
+      type: integer            # ← still validated normally
+    extraConfig:
+      type: object
+      x-kubernetes-preserve-unknown-fields: true  # ← this field accepts anything
+```
+
+```yaml
+# Now this is accepted:
+spec:
+  engine: postgres
+  replicas: 3
+  extraConfig:                 # Anything goes inside here
+    custom_setting_1: "foo"
+    any_key: 42
+    nested:
+      deep: value
+```
+
+**Rules for using this escape hatch:**
+- NEVER use it at the top level of `spec` — defeats the purpose of structural schema
+- Use it only for fields that genuinely need dynamic keys (labels map, annotations map, arbitrary config)
+- In AKS environments: Azure Policy / Gatekeeper may flag CRDs that use this broadly
+
+---
+
+#### Full Example: Structural vs Non-Structural Side-by-Side
+
+```yaml
+# ❌ NON-STRUCTURAL — will be REJECTED by apiextensions.k8s.io/v1
+schema:
+  openAPIV3Schema:
+    properties:           # Missing: type: object
+      spec:
+        properties:       # Missing: type: object
+          engine:
+            type: string
+          config:
+            properties:   # Missing: type: object
+              timeout:
+                type: string
+
+# ✅ STRUCTURAL — accepted, all features unlocked
+schema:
+  openAPIV3Schema:
+    type: object          # ← required
+    properties:
+      spec:
+        type: object      # ← required
+        properties:
+          engine:
+            type: string
+          config:
+            type: object  # ← required
+            properties:
+              timeout:
+                type: string
+```
+
+---
+
+#### Summary Table
+
+| Feature | Requires Structural Schema? | What It Does |
+|---|---|---|
+| **Pruning** | ✅ Yes | Drops unknown fields on admission |
+| **Defaulting** | ✅ Yes | Fills in missing fields with defaults |
+| **Nullable** | ✅ Yes | Allows `null` value for object fields |
+| **CEL validation** | ✅ Yes | `x-kubernetes-validations` rules |
+| **Server-Side Apply** | ✅ Yes | Field ownership tracking |
+| **kubectl explain** | ✅ Yes (richer) | Shows field descriptions from schema |
+
+**Interview answer for "Why is structural schema required?":**
+> Without it, the API server can't safely prune, default, or validate CRs. Structural schema makes the CRD a first-class API citizen — same guarantees as built-in types like Deployments.
 
 ---
 
