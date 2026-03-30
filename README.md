@@ -1,0 +1,1 @@
+# aks-multiregion-operator
